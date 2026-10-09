@@ -1,0 +1,587 @@
+// ==UserScript==
+// @name         HackerRank missing solved counts
+// @namespace    hackerrank-leaderboard-fix
+// @version      2.3
+// @description  Fill blank contest leaderboard scores with solved counts and add ICPC-style per-problem columns (solve time, tries, first solve, solved/tried summary).
+// @match        https://www.hackerrank.com/contests/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+// HackerRank contest leaderboard fix. It only changes what your browser shows;
+// nothing on HackerRank is changed.
+//
+//   1. Blank "Score" cells are filled with each participant's solved-problem count.
+//   2. One column per problem (A, B, C, ...) is added, ICPC style
+//      (ICPC = International Collegiate Programming Contest):
+//        green           solved: time since the contest started (h:mm:ss) + number of tries
+//        solid green ★   first person to solve that problem
+//        red             tried but not solved: number of tries
+//        empty           not tried
+//      Under each letter: solved / tried, counted over ALL participants (not just this page).
+//      Hover over a letter or a cell for details (problem name, penalty, first solver).
+//   3. HackerRank's side panel ("Hackers: All / Friends", "Filter By: Country / Company / School")
+//      is hidden, and the leaderboard takes the full width instead.
+//      To keep the panel, set HIDE_FILTER_PANEL = false below.
+//
+// Where the data comes from: HackerRank's own leaderboard response
+// (/rest/contests/<contest>/leaderboard) already holds every participant's
+// per-problem results, so there are no extra requests per user. The script makes
+// one request per 100 participants, once a minute, and only while the tab is visible.
+//
+// You can also paste this whole file into the browser Console on a contest leaderboard.
+// To stop it: refresh the page, or run  window.__hrSolvedCountFix.stop()
+(() => {
+  'use strict';
+  const controlKey = '__hrSolvedCountFix';
+  window[controlKey]?.stop();
+
+  // ---------- Settings ----------
+  const VERSION = '2.3';
+  const HIDE_FILTER_PANEL = true;  // hide the "Hackers / Filter By" panel so the leaderboard gets the full width
+  const REFRESH_EVERY_MS = 60_000; // re-download the leaderboard this often while the tab is visible
+  const MIN_GAP_MS = 50_000;       // never re-download more often than this
+  const PAGE_SIZE = 100;           // participants per leaderboard request
+  const PROBLEM_COL_PX = 58;       // minimum width of each problem column, including its 2px side gaps
+                                   // (the columns grow to share any extra room)
+  // Content widths for HackerRank's own columns while the problem columns are shown
+  // (HackerRank adds 20px of padding to each of these).
+  const OWN_COLS_PX = { rank: 52, extra: 70, score: 76, penalty: 72 };
+  // Everything except the problem columns: table padding (60px) + pinned Hacker column (180px)
+  // + the columns above, with their padding.
+  const BASE_PX = 60 + 180 + Object.values(OWN_COLS_PX).reduce((sum, px) => sum + px + 20, 0);
+  const STYLE_ID = 'hr-pp-style';
+
+  // ---------- State ----------
+  let participants = new Map(); // username -> that participant's leaderboard entry
+  let problems = [];            // one item per problem, with its solved / tried summary
+  let loadedContest = null;
+  let busy = false;
+  let stopped = false;
+  let attemptedContest = null;
+  let attemptedAt = 0;
+  let scheduled = false;
+  let reportedError = false;
+
+  // ---------- Small helpers ----------
+  function contestSlug() {
+    return location.pathname.match(/^\/contests\/([^/]+)\/leaderboard\/?$/)?.[1] ?? null;
+  }
+
+  function clock(seconds) { // 4502 -> "1:15:02"
+    const s = Math.max(0, Math.round(seconds));
+    const pad = n => String(n).padStart(2, '0');
+    return `${Math.floor(s / 3600)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+  }
+
+  const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  const tries = n => count(n, 'try', 'tries');
+  const penaltyText = seconds =>
+    (seconds % 60 === 0 ? count(seconds / 60, 'minute', 'minutes') : clock(seconds));
+
+  function letterFor(index) { // 0 -> A, 25 -> Z, 26 -> AA
+    let s = '';
+    for (let n = index; n >= 0; n = Math.floor(n / 26) - 1) s = String.fromCharCode(65 + (n % 26)) + s;
+    return s;
+  }
+
+  function make(tag, className, text) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+
+  // ---------- Part 1: solved counts in blank "Score" cells (same as version 1.2) ----------
+  function fillSolvedCounts(rows) {
+    let filled = 0;
+    let original = 0;
+    rows.forEach(row => {
+      const username = row.querySelector('a[username]')?.getAttribute('username');
+      const cell = row.querySelector('.score');
+      const participant = participants.get(username);
+      if (!cell) return;
+      const previous = cell.dataset.hrSolvedFix;
+      if (cell.textContent.trim() && cell.textContent !== previous) {
+        delete cell.dataset.hrSolvedFix; // HackerRank showed a real score here: leave it alone
+        original++;
+        return;
+      }
+      if (!participant || !Number.isFinite(participant.solved_challenges)) return;
+      const value = String(participant.solved_challenges);
+      if (cell.textContent !== value) cell.textContent = value;
+      cell.dataset.hrSolvedFix = value;
+      filled++;
+    });
+    const heading = document.querySelector('.table-header-column.score');
+    if (heading) {
+      const label = filled ? (original ? 'Score / Solved' : 'Solved') : 'Score';
+      if (heading.textContent.trim() !== label) heading.textContent = label;
+    }
+  }
+
+  // ---------- Part 2: per-problem columns ----------
+  // In ICPC-style contests every leaderboard entry carries
+  //   challenges: [{ slug, submissions, time_taken, penalty }, ...]
+  // time_taken > 0 means solved (seconds since the contest started), and penalty is
+  // the extra time for rejected tries before the accepted one.
+  function hasPerProblemData(entries) {
+    return entries.some(e => Array.isArray(e.challenges) &&
+      e.challenges.some(c => c && typeof c.slug === 'string' && 'submissions' in c && 'time_taken' in c));
+  }
+
+  function summarizeProblems(contestChallenges, entries) {
+    const source = Array.isArray(contestChallenges) && contestChallenges.length
+      ? contestChallenges
+      : (entries.find(e => Array.isArray(e.challenges))?.challenges ?? []);
+    const list = source.filter(c => c && c.slug).map((c, i) => ({
+      slug: c.slug,
+      letter: c.letter || letterFor(i),
+      name: c.name || c.slug,
+      solved: 0,
+      tried: 0,
+      submissions: 0,
+      firstTime: Infinity,
+      firstSolvers: [],
+    }));
+    const bySlug = new Map(list.map(p => [p.slug, p]));
+    for (const entry of entries) {
+      for (const c of entry.challenges ?? []) {
+        const p = bySlug.get(c?.slug);
+        if (!p) continue;
+        const subs = Number(c.submissions) || 0;
+        const time = Number(c.time_taken) || 0;
+        p.submissions += subs;
+        if (subs > 0 || time > 0) p.tried++;
+        if (time > 0) {
+          p.solved++;
+          if (time < p.firstTime) {
+            p.firstTime = time;
+            p.firstSolvers = [entry.hacker];
+          } else if (time === p.firstTime) {
+            p.firstSolvers.push(entry.hacker); // a tie to the second: both get the star
+          }
+        }
+      }
+    }
+    return list;
+  }
+
+  function headerCell(p) {
+    const details = [`${p.letter} · ${p.name}`];
+    details.push(p.tried
+      ? `Solved by ${p.solved} of the ${count(p.tried, 'person', 'people')} who tried ` +
+        `(out of ${participants.size} on the leaderboard)`
+      : 'Nobody has tried it yet');
+    if (p.submissions) details.push(`${count(p.submissions, 'submission', 'submissions')} in total`);
+    if (p.solved) details.push(`First solved by ${p.firstSolvers.join(', ')} at ${clock(p.firstTime)}`);
+    return {
+      cls: 'hr-pp-head',
+      title: details.join('\n'),
+      main: p.letter,
+      mainCls: 'hr-pp-letter',
+      sub: `${p.solved}/${p.tried}`,
+    };
+  }
+
+  function participantCell(entry, p) {
+    if (!entry) return { cls: 'hr-pp-cell', title: '' }; // not in the downloaded data yet
+    const c = entry.challenges?.find(x => x?.slug === p.slug);
+    const subs = Number(c?.submissions) || 0;
+    const time = Number(c?.time_taken) || 0;
+    const penalty = Number(c?.penalty) || 0;
+    const name = `${p.letter} · ${p.name}`;
+    if (time > 0) {
+      const n = Math.max(subs, 1);
+      const first = time === p.firstTime;
+      const details = [
+        name,
+        `Solved ${clock(time)} after the contest started`,
+        `${tries(n)} · ${penalty ? `penalty +${penaltyText(penalty)}` : 'no penalty'}`,
+      ];
+      if (first) details.push('★ First to solve this problem');
+      return {
+        cls: `hr-pp-cell hr-pp-solved${first ? ' hr-pp-first' : ''}`,
+        title: details.join('\n'),
+        main: clock(time),
+        sub: tries(n),
+        star: first,
+      };
+    }
+    if (subs > 0) {
+      return { cls: 'hr-pp-cell hr-pp-failed', title: `${name}\nNot solved · ${tries(subs)}, none accepted`, main: tries(subs) };
+    }
+    return { cls: 'hr-pp-cell', title: `${name}\nNot tried` };
+  }
+
+  // Keeps our cells as the last children of `container`, and rewrites a cell only
+  // when its content changed, so HackerRank's own page is disturbed as little as possible.
+  function syncCells(container, cellClass, specs) {
+    const kids = container.children;
+    let cells = [...kids].filter(el => el.classList.contains(cellClass));
+    const inPlace = cells.length === specs.length &&
+      cells.every((el, i) => kids[kids.length - specs.length + i] === el);
+    if (!inPlace) {
+      cells.forEach(el => el.remove());
+      cells = specs.map(() => container.appendChild(make('div', cellClass)));
+    }
+    specs.forEach((spec, i) => {
+      const el = cells[i];
+      const signature = [spec.cls, spec.title, spec.main, spec.sub, spec.star].join('|');
+      if (el.dataset.hrPpSig === signature) return;
+      el.dataset.hrPpSig = signature;
+      el.className = spec.cls;
+      el.title = spec.title;
+      const parts = [];
+      if (spec.main) parts.push(make('span', spec.mainCls || 'hr-pp-main', spec.main));
+      if (spec.sub) parts.push(make('span', 'hr-pp-sub', spec.sub));
+      if (spec.star) parts.push(make('span', 'hr-pp-star', '★'));
+      el.replaceChildren(...parts);
+    });
+  }
+
+  function buildCss(problemCount) {
+    const t = '.general-table[data-hr-pp="on"]';
+    const own = (col, rule) => `${t} .table-header-column.${col}, ${t} .table-row-column.${col} { ${rule} }`;
+    return `
+/* Part 3: HackerRank's "Hackers / Filter By" panel is hidden, and the leaderboard's own column
+   takes the full width (the script marks them with data-hr-pp-hide / data-hr-pp-full). */
+[data-hr-pp-hide="on"] { display: none !important; }
+[data-hr-pp-full="on"] {
+  flex: 1 1 auto !important; width: auto !important; max-width: none !important;
+  float: none !important; grid-column: 1 / -1 !important;
+}
+/* Keep the table inside the leaderboard column at every window width (on a narrow window,
+   or if the panel is kept):
+   - overflow-x: auto       the table scrolls sideways instead of spilling out under the panel
+                            (on wide windows HackerRank does not make this area scrollable);
+   - contain: inline-size   the table's width does not stretch the columns around it;
+   - max-width: 100%        the area is never wider than the leaderboard column. */
+.general-table-wrapper[data-hr-pp="on"] {
+  overflow-x: auto !important; contain: inline-size !important; max-width: 100% !important;
+}
+${t} { min-width: ${BASE_PX + problemCount * PROBLEM_COL_PX}px !important; }
+${own('rank', `flex: 0 0 ${OWN_COLS_PX.rank}px !important;`)}
+${own('extra', `flex: 1 1 ${OWN_COLS_PX.extra}px !important; min-width: 60px;`)}
+${own('score', `flex: 0 0 ${OWN_COLS_PX.score}px !important;`)}
+${own('penalty', `flex: 0 0 ${OWN_COLS_PX.penalty}px !important;`)}
+.hr-pp-head, .hr-pp-cell {
+  box-sizing: border-box; flex: 1 0 ${PROBLEM_COL_PX - 4}px; min-width: ${PROBLEM_COL_PX - 4}px;
+  margin: 0 2px; padding: 0; letter-spacing: 0; text-transform: none; text-align: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; color: inherit;
+}
+.hr-pp-head { cursor: help; }
+.hr-pp-letter { font-size: 15px; font-weight: 700; }
+.hr-pp-head .hr-pp-sub { margin-top: 3px; font-size: 11px; opacity: .7; font-family: SourceCodePro, monaco, Courier, monospace; }
+.hr-pp-cell {
+  position: relative; align-self: stretch; margin-top: 4px; margin-bottom: 4px; border-radius: 4px;
+  font-family: SourceCodePro, monaco, Courier, monospace; font-size: 12px; line-height: 1.3; white-space: nowrap;
+}
+.hr-pp-cell .hr-pp-sub { font-size: 11px; opacity: .8; }
+.hr-pp-solved { background: rgba(34, 197, 94, .30); }
+.hr-pp-first { background: #15803d; color: #fff; font-weight: 700; }
+.hr-pp-failed { background: rgba(239, 68, 68, .30); }
+.hr-pp-star { position: absolute; top: 1px; right: 1px; font-size: 8px; line-height: 1; }
+.hr-pp-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px;
+  padding: 14px 30px 6px; font-size: 13px; line-height: 1.4; color: inherit;
+}
+.hr-pp-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.hr-pp-swatch { position: relative; display: inline-block; flex: none; width: 16px; height: 16px; border-radius: 3px; }
+.hr-pp-swatch .hr-pp-star { top: 4px; right: 4px; }
+.hr-pp-legend-note { opacity: .7; }
+`;
+  }
+
+  function ensureStyle() {
+    let style = document.getElementById(STYLE_ID);
+    if (!style) {
+      style = make('style');
+      style.id = STYLE_ID;
+      document.head.appendChild(style);
+    }
+    const key = String(problems.length);
+    if (style.dataset.problemCount !== key) {
+      style.textContent = buildCss(problems.length);
+      style.dataset.problemCount = key;
+    }
+  }
+
+  function legendItem(swatchClasses, text, star = false) {
+    const swatch = make('span', `hr-pp-swatch ${swatchClasses}`);
+    if (star) swatch.append(make('span', 'hr-pp-star', '★'));
+    const item = make('span', 'hr-pp-legend-item');
+    item.append(swatch, make('span', null, text));
+    return item;
+  }
+
+  function ensureLegend(beforeEl, needsScroll) {
+    const parent = beforeEl?.parentElement;
+    if (!parent) return;
+    let legend = document.querySelector('.hr-pp-legend');
+    if (!legend || legend.nextElementSibling !== beforeEl) {
+      legend?.remove();
+      legend = make('div', 'hr-pp-legend');
+      legend.append(
+        legendItem('hr-pp-solved', 'Solved: time since the contest started, and number of tries'),
+        legendItem('hr-pp-solved hr-pp-first', 'First to solve', true),
+        legendItem('hr-pp-failed', 'Tried, not solved'),
+        make('span', 'hr-pp-legend-note'),
+      );
+      parent.insertBefore(legend, beforeEl);
+    }
+    const note = `Under each letter: solved / tried (out of ${participants.size} participants). ` +
+      'Hover over a letter or a cell for details.' +
+      (needsScroll ? ' The table is wider than the window: scroll it sideways (Shift + mouse wheel) to see every problem.' : '');
+    const noteEl = legend.querySelector('.hr-pp-legend-note');
+    if (noteEl.textContent !== note) noteEl.textContent = note;
+  }
+
+  function renderProblemColumns() {
+    const board = document.querySelector('.ui-leaderboard-table');
+    const table = board?.closest('.general-table') ?? board;
+    if (!table) return;
+    ensureStyle();
+    if (table.dataset.hrPp !== 'on') table.dataset.hrPp = 'on';
+    const wrapper = table.closest('.general-table-wrapper');
+    if (wrapper && wrapper.dataset.hrPp !== 'on') wrapper.dataset.hrPp = 'on';
+    const header = table.querySelector('.table-header');
+    if (header) syncCells(header, 'hr-pp-head', problems.map(p => headerCell(p)));
+    table.querySelectorAll('.table-row').forEach(row => {
+      const username = row.querySelector('a[username]')?.getAttribute('username');
+      const entry = participants.get(username);
+      syncCells(row, 'hr-pp-cell', problems.map(p => participantCell(entry, p)));
+    });
+    const needsScroll = !!wrapper && wrapper.scrollWidth > wrapper.clientWidth + 1;
+    ensureLegend(wrapper ?? table, needsScroll);
+  }
+
+  function removeProblemColumns() {
+    document.querySelectorAll('.hr-pp-head, .hr-pp-cell, .hr-pp-legend').forEach(el => el.remove());
+    document.querySelectorAll('[data-hr-pp]').forEach(el => { delete el.dataset.hrPp; });
+  }
+
+  const ourColumnsShown = () => !!document.querySelector('.hr-pp-head, .hr-pp-cell, .hr-pp-legend');
+
+  // ---------- Part 3: hide the "Hackers / Filter By" panel; the leaderboard gets its space ----------
+  // The panel is found by its labels, not by HackerRank's class names: from a label, climb to
+  // the largest block that does not contain the leaderboard. That block is the panel. Its parent
+  // also holds the leaderboard's own column, which is then widened into the freed space.
+  const PANEL_LABELS = [/^filter\s*by:?$/i, /^friends$/i, /^hackers:?$/i];
+  const hiddenPanels = new Set();
+  let widenedPane = null;
+  const inlineChanges = []; // [element, property, earlier inline value, earlier priority]
+  let lastPanelSearch = 0;
+
+  function setInline(el, prop, value) {
+    inlineChanges.push([el, prop, el.style.getPropertyValue(prop), el.style.getPropertyPriority(prop)]);
+    el.style.setProperty(prop, value, 'important');
+  }
+
+  function findPanelLabels() {
+    const labels = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const text = node.nodeValue.trim();
+      if (text && text.length < 20 && PANEL_LABELS.some(re => re.test(text)) && node.parentElement) {
+        labels.push(node.parentElement);
+      }
+    }
+    return labels;
+  }
+
+  // Buttons the organiser needs; a block that holds them is never hidden.
+  const KEEP_VISIBLE = /manage a contest|create a contest/i;
+
+  function panelAround(label, board) {
+    if (board.contains(label) || label.closest('.hr-pp-legend')) return null;
+    let panel = label;
+    while (panel.parentElement && !panel.parentElement.contains(board) &&
+           !KEEP_VISIBLE.test(panel.parentElement.textContent)) panel = panel.parentElement;
+    if (KEEP_VISIBLE.test(panel.textContent)) return null;
+    const shared = panel.parentElement;
+    if (!shared || panel === document.body) return null;
+    // Safety: never hide navigation, page headings, or anything that fills most of the window.
+    if (panel.matches('nav, header') || panel.querySelector('nav, header, h1') ||
+        panel.querySelectorAll('a[href]').length > 6) return null;
+    const box = panel.getBoundingClientRect();
+    if (box.width > innerWidth * 0.8 && box.height > innerHeight * 0.8) return null;
+    // Skip things that aren't on screen anyway (a closed menu), unless we hid them ourselves.
+    if (!box.width && !box.height && panel.dataset.hrPpHide !== 'on') return null;
+    let depth = 0;
+    for (let el = shared; el; el = el.parentElement) depth++;
+    return { panel, shared, depth, isFilterBy: PANEL_LABELS[0].test(label.textContent.trim()) };
+  }
+
+  function hideFilterPanel() {
+    const board = document.querySelector('.ui-leaderboard-table');
+    if (!board) return;
+    const done = hiddenPanels.size > 0 &&
+      [...hiddenPanels].every(p => p.isConnected && p.dataset.hrPpHide === 'on') &&
+      (!widenedPane || (widenedPane.isConnected && widenedPane.contains(board)));
+    if (done || Date.now() - lastPanelSearch < 500) return;
+    lastPanelSearch = Date.now();
+    const found = findPanelLabels().map(label => panelAround(label, board)).filter(Boolean);
+    if (!found.length) return;
+    restoreFilterPanel(); // forget older, re-rendered copies first
+    ensureStyle();
+    found.forEach(({ panel }) => { panel.dataset.hrPpHide = 'on'; hiddenPanels.add(panel); });
+    // Widen the leaderboard's column that sits next to the "Filter By" panel
+    // (or, without that label, next to the outermost panel found).
+    const { shared } = found.find(f => f.isFilterBy) ?? found.reduce((a, b) => (b.depth < a.depth ? b : a));
+    let pane = board;
+    while (pane.parentElement && pane.parentElement !== shared) pane = pane.parentElement;
+    if (pane.parentElement !== shared || pane.matches('.general-table-wrapper, .general-table')) return;
+    pane.dataset.hrPpFull = 'on';
+    widenedPane = pane;
+    // If HackerRank kept empty room for the panel (padding on the parent or a margin on the
+    // leaderboard column), give that room back too.
+    const sharedStyle = getComputedStyle(shared);
+    if (parseFloat(sharedStyle.paddingRight) - parseFloat(sharedStyle.paddingLeft) > 100) {
+      setInline(shared, 'padding-right', sharedStyle.paddingLeft);
+    }
+    const paneStyle = getComputedStyle(pane);
+    if (parseFloat(paneStyle.marginRight) - parseFloat(paneStyle.marginLeft) > 100) {
+      setInline(pane, 'margin-right', paneStyle.marginLeft);
+    }
+  }
+
+  function restoreFilterPanel() {
+    hiddenPanels.forEach(p => { delete p.dataset.hrPpHide; });
+    hiddenPanels.clear();
+    if (widenedPane) delete widenedPane.dataset.hrPpFull;
+    widenedPane = null;
+    for (const [el, prop, value, priority] of inlineChanges.splice(0)) {
+      if (value) el.style.setProperty(prop, value, priority);
+      else el.style.removeProperty(prop);
+    }
+    document.querySelectorAll('[data-hr-pp-hide], [data-hr-pp-full]').forEach(el => {
+      delete el.dataset.hrPpHide;
+      delete el.dataset.hrPpFull;
+    });
+  }
+
+  // ---------- Putting it on the page ----------
+  function apply() {
+    if (stopped) return;
+    if (HIDE_FILTER_PANEL && contestSlug()) hideFilterPanel();
+    else if (hiddenPanels.size || widenedPane) restoreFilterPanel();
+    if (!loadedContest || contestSlug() !== loadedContest) {
+      // Another page or another contest: drop columns that belong to old data.
+      if (ourColumnsShown()) removeProblemColumns();
+      return;
+    }
+    fillSolvedCounts(document.querySelectorAll('.table-row'));
+    if (problems.length) renderProblemColumns();
+    else if (ourColumnsShown()) removeProblemColumns();
+  }
+
+  function safeApply() {
+    try {
+      apply();
+    } catch (error) {
+      if (!reportedError) console.error('HackerRank leaderboard fix:', error);
+      reportedError = true;
+    }
+  }
+
+  async function refresh() {
+    const slug = contestSlug();
+    if (!slug || busy || stopped || document.hidden) return;
+    if (attemptedContest === slug && Date.now() - attemptedAt < MIN_GAP_MS) return;
+    attemptedContest = slug;
+    attemptedAt = Date.now();
+    busy = true;
+    try {
+      const updated = new Map();
+      let contestChallenges = null;
+      let offset = 0;
+      while (!stopped && contestSlug() === slug) {
+        const url = new URL(`/rest/contests/${slug}/leaderboard`, location.origin);
+        url.search = new URLSearchParams({ offset, limit: PAGE_SIZE, include_practice: 'true' });
+        const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data.models)) throw new Error('Unexpected leaderboard response');
+        contestChallenges ??= Array.isArray(data.contest_challenges) ? data.contest_challenges : null;
+        const before = updated.size;
+        data.models.forEach(entry => updated.set(entry.hacker, entry));
+        offset += data.models.length;
+        const total = Number(data.total);
+        if (!data.models.length || updated.size === before ||
+            (Number.isFinite(total) ? offset >= total : data.models.length < PAGE_SIZE)) break;
+      }
+      if (stopped || contestSlug() !== slug) return;
+      const entries = [...updated.values()];
+      participants = updated;
+      problems = hasPerProblemData(entries) ? summarizeProblems(contestChallenges, entries) : [];
+      loadedContest = slug;
+      safeApply();
+    } catch (error) {
+      console.error('HackerRank leaderboard fix:', error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Re-check the page at most once per frame: after HackerRank changes the page, and when
+  // the window is resized (so the "scroll sideways" note stays correct).
+  function schedule() {
+    if (scheduled || stopped) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      safeApply();
+      if (contestSlug() !== loadedContest) refresh();
+    });
+  }
+  const observer = new MutationObserver(schedule);
+  observer.observe(document.body, { childList: true, subtree: true });
+  window.addEventListener('resize', schedule);
+  const interval = setInterval(refresh, REFRESH_EVERY_MS);
+  const onVisible = () => { if (!document.hidden) refresh(); };
+  document.addEventListener('visibilitychange', onVisible);
+  window[controlKey] = {
+    version: VERSION,
+    // Layout facts for troubleshooting (positions and CSS only, no participant data).
+    // In the browser Console:  copy(__hrSolvedCountFix.diagnose())  then paste the result.
+    diagnose() {
+      const describe = el => {
+        if (!el) return null;
+        const b = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return `${el.tagName.toLowerCase()}.${[...el.classList].join('.')} | x ${Math.round(b.left)} to ${Math.round(b.right)} | ` +
+          `display ${s.display}, position ${s.position}, float ${s.float}, overflow-x ${s.overflowX}, ` +
+          `width ${s.width}, min ${s.minWidth}, max ${s.maxWidth}, flex ${s.flex}, contain ${s.contain}`;
+      };
+      const upFrom = start => {
+        const out = [];
+        for (let el = start; el && el !== document.body && out.length < 10; el = el.parentElement) out.push(describe(el));
+        return out;
+      };
+      const filterLabel = [...document.querySelectorAll('body *')]
+        .find(el => !el.children.length && /^filter by$/i.test(el.textContent.trim()));
+      return JSON.stringify({
+        version: VERSION,
+        window: [innerWidth, innerHeight],
+        panelsHidden: hiddenPanels.size,
+        widenedColumn: describe(widenedPane),
+        table: describe(document.querySelector('.general-table')),
+        tableAreaAndParents: upFrom(document.querySelector('.general-table-wrapper')),
+        filterPanelAndParents: upFrom(filterLabel),
+      }, null, 1);
+    },
+    stop() {
+      stopped = true;
+      observer.disconnect();
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('resize', schedule);
+      removeProblemColumns();
+      restoreFilterPanel();
+      document.getElementById(STYLE_ID)?.remove();
+    },
+  };
+  refresh();
+})();
