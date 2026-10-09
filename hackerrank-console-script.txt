@@ -1,0 +1,105 @@
+// Paste this entire file into the Console on a HackerRank contest leaderboard.
+// Refresh the page to stop it. Only your browser display is changed.
+(() => {
+  'use strict';
+  const controlKey = '__hrSolvedCountFix';
+  window[controlKey]?.stop();
+  let participants = new Map();
+  let loadedContest = null;
+  let busy = false;
+  let stopped = false;
+  let attemptedContest = null;
+  let attemptedAt = 0;
+  let scheduled = false;
+
+  function contestSlug() {
+    return location.pathname.match(/^\/contests\/([^/]+)\/leaderboard\/?$/)?.[1] ?? null;
+  }
+
+  function apply() {
+    if (stopped || contestSlug() !== loadedContest || !loadedContest) return;
+    let filled = 0;
+    let original = 0;
+    document.querySelectorAll('.table-row').forEach(row => {
+      const username = row.querySelector('a[username]')?.getAttribute('username');
+      const cell = row.querySelector('.score');
+      const participant = participants.get(username);
+      if (!cell) return;
+      const previous = cell.dataset.hrSolvedFix;
+      if (cell.textContent.trim() && cell.textContent !== previous) {
+        delete cell.dataset.hrSolvedFix;
+        original++;
+        return;
+      }
+      if (!participant || !Number.isFinite(participant.solved_challenges)) return;
+      const value = String(participant.solved_challenges);
+      if (cell.textContent !== value) cell.textContent = value;
+      cell.dataset.hrSolvedFix = value;
+      filled++;
+    });
+    const heading = document.querySelector('.table-header-column.score');
+    if (heading) {
+      const label = filled ? (original ? 'Score / Solved' : 'Solved') : 'Score';
+      if (heading.textContent.trim() !== label) heading.textContent = label;
+    }
+  }
+
+  async function refresh() {
+    const slug = contestSlug();
+    if (!slug || busy || stopped || document.hidden) return;
+    if (attemptedContest === slug && Date.now() - attemptedAt < 60_000) return;
+    attemptedContest = slug;
+    attemptedAt = Date.now();
+    busy = true;
+    try {
+      const updated = new Map();
+      const limit = 100;
+      let offset = 0;
+      while (!stopped && contestSlug() === slug) {
+        const url = new URL(`/rest/contests/${slug}/leaderboard`, location.origin);
+        url.search = new URLSearchParams({ offset, limit, include_practice: 'true' });
+        const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data.models)) throw new Error('Unexpected leaderboard response');
+        const before = updated.size;
+        data.models.forEach(p => updated.set(p.hacker, p));
+        offset += data.models.length;
+        const total = Number(data.total);
+        if (!data.models.length || updated.size === before ||
+            (Number.isFinite(total) ? offset >= total : data.models.length < limit)) break;
+      }
+      if (stopped || contestSlug() !== slug) return;
+      participants = updated;
+      loadedContest = slug;
+      apply();
+    } catch (error) {
+      console.error('HackerRank solved-count fix:', error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  const observer = new MutationObserver(() => {
+    if (scheduled || stopped) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      apply();
+      if (contestSlug() !== loadedContest) refresh();
+    });
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+  const interval = setInterval(refresh, 60_000);
+  const onVisible = () => { if (!document.hidden) refresh(); };
+  document.addEventListener('visibilitychange', onVisible);
+  window[controlKey] = {
+    stop() {
+      stopped = true;
+      observer.disconnect();
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisible);
+    }
+  };
+  refresh();
+})();
